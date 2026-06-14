@@ -17,11 +17,11 @@ $script:Edgey_ModulePath = $PSCommandPath
 # Helpers
 function Test-IsAdmin { ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
 
-function _Invoke-Elevated {
+function Invoke-EdgeyElevated {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Func,
-        [object[]]$Args
+        [object[]]$Parameters
     )
 
     $sessionRoot = Join-Path $env:TEMP ("Edgey_Elevate_{0}" -f ([guid]::NewGuid()))
@@ -32,7 +32,7 @@ function _Invoke-Elevated {
         New-Item -Path $sessionRoot -ItemType Directory -Force | Out-Null
         [pscustomobject]@{
             Func = $Func
-            Args = @($Args)
+            Parameters = @($Parameters)
         } | Export-Clixml -Path $payloadPath
 
         $modulePath = $script:Edgey_ModulePath.Replace("'", "''")
@@ -44,7 +44,7 @@ function _Invoke-Elevated {
 try {
     `$payload = Import-Clixml -Path '$payloadLiteral'
     Import-Module -Force '$modulePath'
-    & `$payload.Func @(`$payload.Args)
+    & `$payload.Func @(`$payload.Parameters)
     'OK' | Out-File -FilePath '$statusLiteral' -Encoding UTF8 -Force
 } catch {
     (`$_ | Out-String) | Out-File -FilePath '$statusLiteral' -Encoding UTF8 -Force
@@ -126,7 +126,7 @@ function Backup-Edge {
         [ValidateSet('User','Machine')]
         [string]$Scope = 'User'
     )
-    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Backup-Edge" -Args @("-Note", $Note, "-Scope", "Machine"); return }
+    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { Invoke-EdgeyElevated -Func "Backup-Edge" -Parameters @("-Note", $Note, "-Scope", "Machine"); return }
 
     $info = _EnsureStore -Scope $Scope
     Stop-Edge -Scope $Scope
@@ -160,7 +160,7 @@ function Push-Edge {
         [ValidateSet('User','Machine')]
         [string]$Scope = 'User'
     )
-    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Push-Edge" -Args @("-Note", $Note, "-Scope", "Machine"); return }
+    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { Invoke-EdgeyElevated -Func "Push-Edge" -Parameters @("-Note", $Note, "-Scope", "Machine"); return }
     $b = Backup-Edge -Note $Note -Scope $Scope
     if (-not $b) { throw "Backup failed." }
     foreach ($f in $b.Files) { if (Test-Path $f.Source) { Rename-Item -Path $f.Source -NewName ($([IO.Path]::GetFileName($f.Source) + ".bak")) -ErrorAction SilentlyContinue } }
@@ -173,7 +173,7 @@ function Pop-Edge {
         [ValidateSet('User','Machine')]
         [string]$Scope = 'User'
     )
-    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Pop-Edge" -Args @("-Scope", "Machine"); return }
+    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { Invoke-EdgeyElevated -Func "Pop-Edge" -Parameters @("-Scope", "Machine"); return }
     $info = _EnsureStore -Scope $Scope
     Stop-Edge -Scope $Scope
     $stack = _ReadStack $info.Stack
@@ -208,7 +208,7 @@ function Restore-Edge {
         [ValidateSet('User','Machine')]
         [string]$Scope = 'User'
     )
-    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Restore-Edge" -Args @("-Id", $Id, "-Scope", "Machine"); return }
+    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { Invoke-EdgeyElevated -Func "Restore-Edge" -Parameters @("-Id", $Id, "-Scope", "Machine"); return }
     $info = _EnsureStore -Scope $Scope
     Stop-Edge -Scope $Scope
     $stack = _ReadStack $info.Stack
@@ -226,21 +226,297 @@ function Restore-Edge {
     Write-Output "Restored id: $Id"
 }
 
+function Get-EdgeDsregcmdStatusLines {
+    [CmdletBinding()]
+    param()
+    try {
+        @(dsregcmd /status 2>&1 | ForEach-Object { $_.ToString() })
+    } catch {
+        @()
+    }
+}
+
+function Get-EdgeDsregcmdDiagnosticsReport {
+    [CmdletBinding()]
+    param()
+
+    $lines = @(Get-EdgeDsregcmdStatusLines)
+    $summary = @(
+        $lines |
+            Where-Object { $_ -match '^\s*(AzureAdJoined|WorkplaceJoined|WorkplaceTenantId)\s*:\s*.+$' }
+    )
+    if ($null -eq $summary) { $summary = @() }
+
+    [ordered]@{
+        command = 'dsregcmd /status'
+        status  = if ($lines.Count -gt 0) { 'ok' } else { 'unavailable' }
+        summary  = $summary
+    }
+}
+
+function Get-EdgeInstallDiagnosticsReport {
+    [CmdletBinding()]
+    param()
+
+    $roots = @(_GetEdgeInstallRoots)
+    $versions = foreach ($root in $roots) {
+        $exe = Join-Path $root 'msedge.exe'
+        if (Test-Path $exe) {
+            [ordered]@{
+                path    = $root
+                version = (Get-Item $exe).VersionInfo.ProductVersion
+            }
+        }
+    }
+
+    [ordered]@{
+        roots    = $roots
+        versions = if ($null -eq $versions) { @() } else { @($versions) }
+    }
+}
+
+function Get-EdgeVariationDiagnosticsReport {
+    [CmdletBinding()]
+    param()
+
+    $roots = @(_GetEdgeInstallRoots)
+    $candidatePaths = @(_GetProfileVariations) + @($roots | ForEach-Object { Join-Path $_ 'Variations' })
+    $paths = @($candidatePaths | Select-Object -Unique)
+    $files = foreach ($path in $paths) {
+        if (Test-Path $path) {
+            Get-ChildItem -Path $path -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match 'seed|variations_seed' } |
+                ForEach-Object {
+                    [ordered]@{
+                        folder = $path
+                        file   = $_.Name
+                        hash   = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
+                        size   = $_.Length
+                    }
+                }
+        }
+    }
+
+    [ordered]@{
+        paths = $paths
+        files = if ($null -eq $files) { @() } else { @($files) }
+    }
+}
+
+function Get-EdgeProcessDiagnosticsReport {
+    [CmdletBinding()]
+    param()
+
+    $processes = @(Get-Process -Name msedge -ErrorAction SilentlyContinue | Select-Object Id,StartTime,Path -ErrorAction SilentlyContinue)
+    if ($null -eq $processes) { $processes = @() }
+
+    [ordered]@{
+        name      = 'msedge'
+        processes = $processes
+    }
+}
+
+function Get-EdgeBackupDiagnosticsReport {
+    [CmdletBinding()]
+    param()
+
+    $userInfo = _EnsureStore -Scope User
+    $adminInfo = if (Test-IsAdmin) { _EnsureStore -Scope Machine } else { $null }
+    $userBackups = @()
+    if (Test-Path $userInfo.Root) {
+        $userBackups = @(Get-ChildItem -Path $userInfo.Root -Directory -ErrorAction SilentlyContinue | Select-Object Name,LastWriteTime)
+        if ($null -eq $userBackups) { $userBackups = @() }
+    }
+
+    $machineRoot = 'requires elevation'
+    $machineBackups = @()
+    if ($adminInfo) {
+        $machineRoot = $adminInfo.Root
+        if (Test-Path $adminInfo.Root) {
+            $machineBackups = @(Get-ChildItem -Path $adminInfo.Root -Directory -ErrorAction SilentlyContinue | Select-Object Name,LastWriteTime)
+            if ($null -eq $machineBackups) { $machineBackups = @() }
+        }
+    }
+
+    [ordered]@{
+        user = [ordered]@{
+            root    = $userInfo.Root
+            backups = $userBackups
+        }
+        machine = [ordered]@{
+            root    = $machineRoot
+            backups = $machineBackups
+        }
+    }
+}
+
+function New-EdgeDiagnosticsReport {
+    [CmdletBinding()]
+    param()
+
+    [ordered]@{
+        generatedAt = (Get-Date).ToString('o')
+        computer    = $env:COMPUTERNAME
+        user        = $env:USERNAME
+        dsregcmd    = Get-EdgeDsregcmdDiagnosticsReport
+        edge        = Get-EdgeInstallDiagnosticsReport
+        variations  = Get-EdgeVariationDiagnosticsReport
+        processes   = Get-EdgeProcessDiagnosticsReport
+        backups     = Get-EdgeBackupDiagnosticsReport
+    }
+}
+
+function Test-IsEdgeDiagnosticsScalar {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $true }
+    if ($Value -is [string]) { return $true }
+    if ($Value -is [char]) { return $true }
+    if ($Value -is [bool]) { return $true }
+    if ($Value -is [datetime]) { return $true }
+    if ($Value -is [datetimeoffset]) { return $true }
+    if ($Value -is [guid]) { return $true }
+    if ($Value -is [timespan]) { return $true }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [short] -or $Value -is [ushort] -or $Value -is [int] -or $Value -is [uint] -or $Value -is [long] -or $Value -is [ulong] -or $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]) { return $true }
+    return $false
+}
+
+function ConvertTo-EdgeDiagnosticsArray {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [array]) { return @($Value) }
+    if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) { return @($Value) }
+    return @($Value)
+}
+
+function ConvertTo-EdgeDiagnosticsYamlScalar {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
+    if ($Value -is [datetime] -or $Value -is [datetimeoffset]) { return "'$($Value.ToString('o'))'" }
+    if ($Value -is [guid] -or $Value -is [timespan]) { return "'$($Value.ToString())'" }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [short] -or $Value -is [ushort] -or $Value -is [int] -or $Value -is [uint] -or $Value -is [long] -or $Value -is [ulong] -or $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]) {
+        return ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0}', $Value))
+    }
+
+    $text = [string]$Value
+    return "'$( $text -replace "'", "''" )'"
+}
+
+function ConvertTo-EdgeDiagnosticsYamlLines {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$InputObject,
+        [int]$Indent = 0
+    )
+
+    $pad = ' ' * $Indent
+
+    if (Test-IsEdgeDiagnosticsScalar $InputObject) {
+        return @("$pad$(ConvertTo-EdgeDiagnosticsYamlScalar $InputObject)")
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $lines = @()
+        foreach ($key in $InputObject.Keys) {
+            $value = $InputObject[$key]
+            $lines += ConvertTo-EdgeDiagnosticsYamlEntry -Name ([string]$key) -Value $value -Indent $Indent
+        }
+        return $lines
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable]) {
+        $items = @($InputObject)
+        if ($items.Count -eq 0) { return @("$pad[]") }
+
+        $lines = @()
+        foreach ($item in $items) {
+            if (Test-IsEdgeDiagnosticsScalar $item) {
+                $lines += "${pad}- $(ConvertTo-EdgeDiagnosticsYamlScalar $item)"
+            } else {
+                $lines += "${pad}-"
+                $lines += ConvertTo-EdgeDiagnosticsYamlLines -InputObject $item -Indent ($Indent + 2)
+            }
+        }
+        return $lines
+    }
+
+    $properties = @($InputObject.PSObject.Properties)
+    if ($properties.Count -eq 0) {
+        return @("$pad{}")
+    }
+
+    $lines = @()
+    foreach ($property in $properties) {
+        $lines += ConvertTo-EdgeDiagnosticsYamlEntry -Name $property.Name -Value $property.Value -Indent $Indent
+    }
+    return $lines
+}
+
+function ConvertTo-EdgeDiagnosticsYamlEntry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [object]$Value,
+        [int]$Indent = 0
+    )
+
+    $pad = ' ' * $Indent
+
+    if ($null -eq $Value) {
+        return @("${pad}${Name}: null")
+    }
+
+    if (Test-IsEdgeDiagnosticsScalar $Value) {
+        return @("${pad}${Name}: $(ConvertTo-EdgeDiagnosticsYamlScalar $Value)")
+    }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        $items = @($Value.Keys)
+        if ($items.Count -eq 0) { return @("${pad}${Name}: {}") }
+
+        $lines = @("${pad}${Name}:")
+        $lines += ConvertTo-EdgeDiagnosticsYamlLines -InputObject $Value -Indent ($Indent + 2)
+        return $lines
+    }
+
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = @($Value)
+        if ($items.Count -eq 0) { return @("${pad}${Name}: []") }
+
+        $lines = @("${pad}${Name}:")
+        foreach ($item in $items) {
+            if (Test-IsEdgeDiagnosticsScalar $item) {
+                $lines += "$((' ' * ($Indent + 2)))- $(ConvertTo-EdgeDiagnosticsYamlScalar $item)"
+            } else {
+                $lines += "$((' ' * ($Indent + 2)))-"
+                $lines += ConvertTo-EdgeDiagnosticsYamlLines -InputObject $item -Indent ($Indent + 4)
+            }
+        }
+        return $lines
+    }
+
+    $lines = @("${pad}${Name}:")
+    $lines += ConvertTo-EdgeDiagnosticsYamlLines -InputObject $Value -Indent ($Indent + 2)
+    return $lines
+}
+
+function ConvertTo-EdgeDiagnosticsYamlText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$InputObject
+    )
+
+    @(ConvertTo-EdgeDiagnosticsYamlLines -InputObject $InputObject) -join "`n"
+}
+
 function Test-Edge {
     [CmdletBinding()]
     param()
-    $o = [ordered]@{}
-    try { $ds = dsregcmd /status 2>&1; $o.Dsreg = ($ds | Select-String -Pattern 'AzureAdJoined|WorkplaceJoined|WorkplaceTenantId' -SimpleMatch).ToString() } catch { $o.Dsreg = "dsregcmd unavailable" }
-    $roots = _GetEdgeInstallRoots; $o.EdgeRoots = $roots
-    $vers = @(); foreach ($r in $roots) { $exe = Join-Path $r "msedge.exe"; if (Test-Path $exe) { $vers += [pscustomobject]@{ Path=$r; Version=(Get-Item $exe).VersionInfo.ProductVersion } } }
-    $o.EdgeVersions = $vers
-    $vars = @(); $cands = @(_GetProfileVariations) + @($roots | ForEach-Object { Join-Path $_ "Variations" })
-    foreach ($v in $cands | Select-Object -Unique) { if (Test-Path $v) { Get-ChildItem -Path $v -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'seed|variations_seed' } | ForEach-Object { $h=(Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash; $vars += [pscustomobject]@{ Folder=$v; File=$_.Name; Hash=$h; Size=$_.Length } } } }
-    $o.Variations = $vars
-    $o.Processes = Get-Process -Name msedge -ErrorAction SilentlyContinue | Select-Object Id,StartTime,Path -ErrorAction SilentlyContinue
-    $userInfo = _EnsureStore -Scope User; $o.UserBackupRoot = $userInfo.Root; $o.UserBackups = if (Test-Path $userInfo.Root) { Get-ChildItem -Path $userInfo.Root -Directory -ErrorAction SilentlyContinue | Select-Object Name,LastWriteTime } else { @() }
-    if (Test-IsAdmin) { $adm = _EnsureStore -Scope Machine; $o.AdminBackupRoot = $adm.Root; $o.AdminBackups = if (Test-Path $adm.Root) { Get-ChildItem -Path $adm.Root -Directory -ErrorAction SilentlyContinue | Select-Object Name,LastWriteTime } else { @() } } else { $o.AdminBackupRoot = "requires elevation" }
-    [PSCustomObject]$o
+    $report = New-EdgeDiagnosticsReport
+    ConvertTo-EdgeDiagnosticsYamlText -InputObject $report
 }
 
 Export-ModuleMember -Function Backup-Edge, Push-Edge, Pop-Edge, Get-EdgeBackups, Restore-Edge, Test-Edge, Stop-Edge

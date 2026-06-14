@@ -1,0 +1,44 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Pester: All Tests",
+            "type": "shell",
+            "command": "pwsh",
+            "args": [
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Invoke-Pester -Path . -Output Detailed"
+            ],
+            "group": "test",
+            "problemMatcher": []
+        },
+        {
+            "label": "Pester: Current Test File",
+            "type": "shell",
+            "command": "pwsh",
+            "args": [
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Invoke-Pester -Path \"${file}\" -Output Detailed"
+            ],
+            "group": "test",
+            "problemMatcher": []
+        },
+        {
+            "label": "PSScriptAnalyzer: Workspace",
+            "type": "shell",
+            "command": "pwsh",
+            "args": [
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Invoke-ScriptAnalyzer -Path . -Recurse -Settings PSScriptAnalyzerSettings.psd1"
+            ],
+            "group": "build",
+            "problemMatcher": []
+        }
+    ]
+}

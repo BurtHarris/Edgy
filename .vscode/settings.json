@@ -1,0 +1,28 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "Invoke-Pester": true
+    },
+    "editor.formatOnSave": true,
+    "editor.renderWhitespace": "selection",
+    "files.eol": "\n",
+    "files.trimTrailingWhitespace": true,
+    "files.insertFinalNewline": true,
+    "[powershell]": {
+        "editor.defaultFormatter": "ms-vscode.powershell",
+        "editor.formatOnSave": true,
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
+    },
+    "powershell.enableProfileLoading": false,
+    "powershell.codeFormatting.preset": "OTBS",
+    "powershell.codeFormatting.whitespaceAroundOperator": true,
+    "powershell.codeFormatting.whitespaceBeforeOpenBrace": true,
+    "powershell.codeFormatting.addWhitespaceAroundPipe": true,
+    "powershell.codeFormatting.alignPropertyValuePairs": false,
+    "powershell.scriptAnalysis.enable": true,
+    "powershell.scriptAnalysis.settingsPath": "PSScriptAnalyzerSettings.psd1",
+    "powershell.integratedConsole.focusConsoleOnExecute": false,
+    "powershell.integratedConsole.showOnStartup": false,
+    "powershell.pester.useLegacyCodeLens": false,
+    "terminal.integrated.defaultProfile.windows": "PowerShell"
+}

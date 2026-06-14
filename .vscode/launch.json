@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "PowerShell: Launch Current File",
+            "type": "PowerShell",
+            "request": "launch",
+            "script": "${file}",
+            "cwd": "${workspaceFolder}",
+            "createTemporaryIntegratedConsole": true
+        },
+        {
+            "name": "PowerShell: Debug Pester (Current File)",
+            "type": "PowerShell",
+            "request": "launch",
+            "script": "Invoke-Pester -Path \"${file}\" -Output Detailed",
+            "cwd": "${workspaceFolder}",
+            "createTemporaryIntegratedConsole": true
+        },
+        {
+            "name": "PowerShell: Debug Pester (All)",
+            "type": "PowerShell",
+            "request": "launch",
+            "script": "Invoke-Pester -Path \"${workspaceFolder}\" -Output Detailed",
+            "cwd": "${workspaceFolder}",
+            "createTemporaryIntegratedConsole": true
+        }
+    ]
+}
