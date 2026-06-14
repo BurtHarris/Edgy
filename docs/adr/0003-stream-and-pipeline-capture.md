@@ -1,0 +1,3 @@
+# Stream And Pipeline Capture Model
+
+New-WhyLog will preserve standard PowerShell behavior inside its scriptblock while capturing output into ordered YAML entries. Narrative output is emitted as narrative entries, tagged signals map to information/warning/error semantics, and mixed object/string pipeline output is preserved in original emission order, because fidelity to native PowerShell flow is more important than imposing a rigid schema.
