@@ -1,40 +1,93 @@
-```powershell
+#!/usr/bin/env powershell
+#Requires -Version 5.1
+
 <#
 .SYNOPSIS
-Edgey - simple per-user-first tools to backup/disable/restore Edge variations seed files and diagnose state.
+Edgey - simple scope-based tools to backup/disable/restore Edge variations seed files and diagnose state.
 .DESCRIPTION
-Auto-initializes per-user store on import. Elevates only for machine-level operations.
+Initializes per-scope store on demand. Elevates only for machine-level operations.
 #>
 
 # Config
 $script:Edgey_UserRoot = Join-Path $env:USERPROFILE "EdgeyBackup"
 $script:Edgey_AdminRoot = "C:\EdgeyBackup"
 $script:Edgey_StackName = "stack.json"
+$script:Edgey_ModulePath = $PSCommandPath
 
 # Helpers
 function Test-IsAdmin { ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
 
 function _Invoke-Elevated {
-    param($Func, $Args)
-    $tmp = Join-Path $env:TEMP ("Edgey_Elevate_{0}.ps1" -f ([guid]::NewGuid()))
-    $argLine = if ($Args) { $Args -join ' ' } else { '' }
-    $script = "Import-Module `"$PSScriptRoot\Edgey.psm1`"`n& $Func $argLine"
-    $script | Out-File -FilePath $tmp -Encoding UTF8
-    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`"" -Verb RunAs -Wait
-    Remove-Item $tmp -ErrorAction SilentlyContinue
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Func,
+        [object[]]$Args
+    )
+
+    $sessionRoot = Join-Path $env:TEMP ("Edgey_Elevate_{0}" -f ([guid]::NewGuid()))
+    $payloadPath = Join-Path $sessionRoot "payload.clixml"
+    $statusPath = Join-Path $sessionRoot "status.txt"
+
+    try {
+        New-Item -Path $sessionRoot -ItemType Directory -Force | Out-Null
+        [pscustomobject]@{
+            Func = $Func
+            Args = @($Args)
+        } | Export-Clixml -Path $payloadPath
+
+        $modulePath = $script:Edgey_ModulePath.Replace("'", "''")
+        $payloadLiteral = $payloadPath.Replace("'", "''")
+        $statusLiteral = $statusPath.Replace("'", "''")
+
+        $elevatedCommand = @"
+`$ErrorActionPreference = 'Stop'
+try {
+    `$payload = Import-Clixml -Path '$payloadLiteral'
+    Import-Module -Force '$modulePath'
+    & `$payload.Func @(`$payload.Args)
+    'OK' | Out-File -FilePath '$statusLiteral' -Encoding UTF8 -Force
+} catch {
+    (`$_ | Out-String) | Out-File -FilePath '$statusLiteral' -Encoding UTF8 -Force
+    exit 1
+}
+"@
+
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($elevatedCommand))
+        $proc = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded) -Verb RunAs -Wait -PassThru
+
+        $status = if (Test-Path $statusPath) { Get-Content -Path $statusPath -Raw } else { $null }
+        if ($proc.ExitCode -ne 0 -or -not $status -or $status.Trim() -ne "OK") {
+            throw "Elevated operation '$Func' failed."
+        }
+    } finally {
+        Remove-Item -Path $sessionRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function _EnsureStore {
-    param([switch]$PerUser)
-    $root = if ($PerUser) { $script:Edgey_UserRoot } else { $script:Edgey_AdminRoot }
+    param(
+        [ValidateSet('User','Machine')]
+        [string]$Scope = 'User'
+    )
+    $root = if ($Scope -eq 'User') { $script:Edgey_UserRoot } else { $script:Edgey_AdminRoot }
     if (-not (Test-Path $root)) { New-Item -Path $root -ItemType Directory -Force | Out-Null }
     $stack = Join-Path $root $script:Edgey_StackName
     if (-not (Test-Path $stack)) { @() | ConvertTo-Json | Out-File -FilePath $stack -Encoding UTF8 }
     return @{ Root = $root; Stack = $stack }
 }
 
-function _ReadStack($stackFile) { if (-not (Test-Path $stackFile)) { @() } else { Get-Content $stackFile -Raw | ConvertFrom-Json } }
-function _WriteStack($stackFile,$obj) { $obj | ConvertTo-Json -Depth 6 | Out-File -FilePath $stackFile -Encoding UTF8 }
+function _ReadStack($stackFile) {
+    if (-not (Test-Path $stackFile)) { return @() }
+    $raw = Get-Content $stackFile -Raw
+    if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+    $parsed = $raw | ConvertFrom-Json
+    if ($null -eq $parsed) { return @() }
+    return @($parsed)
+}
+function _WriteStack($stackFile,$obj) {
+    $normalized = if ($null -eq $obj) { @() } else { @($obj) }
+    $normalized | ConvertTo-Json -Depth 6 | Out-File -FilePath $stackFile -Encoding UTF8
+}
 
 function _GetEdgeInstallRoots {
     @("C:\Program Files (x86)\Microsoft\Edge\Application","C:\Program Files\Microsoft\Edge\Application") | ForEach-Object {
@@ -51,9 +104,13 @@ function _GetProfileVariations {
     }
 }
 
-function Stop-Edgey {
-    param([switch]$PerUser)
-    if ($PerUser) {
+function Stop-Edge {
+    [CmdletBinding()]
+    param(
+        [ValidateSet('User','Machine')]
+        [string]$Scope = 'User'
+    )
+    if ($Scope -eq 'User') {
         $sid = (Get-Process -Id $PID).SessionId
         Get-Process -Name msedge -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $sid } | Stop-Process -Force -ErrorAction SilentlyContinue
     } else {
@@ -61,18 +118,19 @@ function Stop-Edgey {
     }
 }
 
-# Auto-init on import
-_EnsureStore -PerUser | Out-Null
-
 # Core commands
-function Backup-Edgey {
+function Backup-Edge {
     [CmdletBinding()]
-    param([string]$Note = "", [switch]$PerUser)
-    if (-not $PerUser -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Backup-Edgey" -Args @("-Note `"$Note`"","-PerUser:$false"); return }
+    param(
+        [string]$Note = "",
+        [ValidateSet('User','Machine')]
+        [string]$Scope = 'User'
+    )
+    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Backup-Edge" -Args @("-Note", $Note, "-Scope", "Machine"); return }
 
-    $info = _EnsureStore -PerUser:$PerUser
-    Stop-Edgey -PerUser:$PerUser
-    $paths = if ($PerUser) { _GetProfileVariations } else { _GetEdgeInstallRoots | ForEach-Object { Join-Path $_ "Variations" } }
+    $info = _EnsureStore -Scope $Scope
+    Stop-Edge -Scope $Scope
+    $paths = if ($Scope -eq 'User') { _GetProfileVariations } else { _GetEdgeInstallRoots | ForEach-Object { Join-Path $_ "Variations" } }
     if (-not $paths) { Write-Output "No variations paths found."; return }
 
     $id = [guid]::NewGuid().ToString(); $ts = (Get-Date).ToString("yyyyMMdd_HHmmss")
@@ -90,27 +148,34 @@ function Backup-Edgey {
             }
         }
     }
-    $entry = [pscustomobject]@{ Id=$id; Timestamp=$ts; Note=$Note; PerUser=$PerUser.IsPresent; Files=$col }
+    $entry = [pscustomobject]@{ Id=$id; Timestamp=$ts; Note=$Note; Scope=$Scope; PerUser=($Scope -eq 'User'); Files=$col }
     $stack = _ReadStack $info.Stack; $stack = ,$entry + $stack; _WriteStack $info.Stack $stack
     return $entry
 }
 
-function Push-Edgey {
+function Push-Edge {
     [CmdletBinding()]
-    param([string]$Note = "", [switch]$PerUser)
-    if (-not $PerUser -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Push-Edgey" -Args @("-Note `"$Note`"","-PerUser:$false"); return }
-    $b = Backup-Edgey -Note $Note -PerUser:$PerUser
+    param(
+        [string]$Note = "",
+        [ValidateSet('User','Machine')]
+        [string]$Scope = 'User'
+    )
+    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Push-Edge" -Args @("-Note", $Note, "-Scope", "Machine"); return }
+    $b = Backup-Edge -Note $Note -Scope $Scope
     if (-not $b) { throw "Backup failed." }
     foreach ($f in $b.Files) { if (Test-Path $f.Source) { Rename-Item -Path $f.Source -NewName ($([IO.Path]::GetFileName($f.Source) + ".bak")) -ErrorAction SilentlyContinue } }
     Write-Output "Pushed: $($b.Id)"
 }
 
-function Pop-Edgey {
+function Pop-Edge {
     [CmdletBinding()]
-    param([switch]$PerUser)
-    if (-not $PerUser -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Pop-Edgey" -Args @("-PerUser:$false"); return }
-    $info = _EnsureStore -PerUser:$PerUser
-    Stop-Edgey -PerUser:$PerUser
+    param(
+        [ValidateSet('User','Machine')]
+        [string]$Scope = 'User'
+    )
+    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Pop-Edge" -Args @("-Scope", "Machine"); return }
+    $info = _EnsureStore -Scope $Scope
+    Stop-Edge -Scope $Scope
     $stack = _ReadStack $info.Stack
     if (-not $stack -or $stack.Count -eq 0) { throw "No backups." }
     $entry = $stack[0]
@@ -118,22 +183,34 @@ function Pop-Edgey {
         if (Test-Path $f.Backup) {
             try { Copy-Item -Path $f.Backup -Destination $f.Source -Force -ErrorAction SilentlyContinue } catch {
                 $leaf = Split-Path $f.Source -Leaf
-                $cands = if ($PerUser) { _GetProfileVariations } else { _GetEdgeInstallRoots | ForEach-Object { Join-Path $_ "Variations" } }
+                $cands = if ($Scope -eq 'User') { _GetProfileVariations } else { _GetEdgeInstallRoots | ForEach-Object { Join-Path $_ "Variations" } }
                 foreach ($c in $cands) { $cand = Join-Path $c $leaf; Copy-Item -Path $f.Backup -Destination $cand -Force -ErrorAction SilentlyContinue }
             }
         }
         $bak = $f.Source + ".bak"; if (Test-Path $bak) { Remove-Item $bak -Force -ErrorAction SilentlyContinue }
     }
-    $new = $stack | Select-Object -Skip 1; _WriteStack $info.Stack $new
+    $new = @($stack | Select-Object -Skip 1); _WriteStack $info.Stack $new
     Write-Output "Restored: $($entry.Id)"
 }
 
-function Get-EdgeyBackups { param([switch]$PerUser) $info = _EnsureStore -PerUser:$PerUser; _ReadStack $info.Stack }
+function Get-EdgeBackups {
+    param(
+        [ValidateSet('User','Machine')]
+        [string]$Scope = 'User'
+    )
+    $info = _EnsureStore -Scope $Scope
+    _ReadStack $info.Stack
+}
 
-function Restore-Edgey {
-    param([Parameter(Mandatory=$true)][string]$Id, [switch]$PerUser)
-    if (-not $PerUser -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Restore-Edgey" -Args @("-Id `"$Id`"","-PerUser:$false"); return }
-    $info = _EnsureStore -PerUser:$PerUser
+function Restore-Edge {
+    param(
+        [Parameter(Mandatory=$true)][string]$Id,
+        [ValidateSet('User','Machine')]
+        [string]$Scope = 'User'
+    )
+    if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) { _Invoke-Elevated -Func "Restore-Edge" -Args @("-Id", $Id, "-Scope", "Machine"); return }
+    $info = _EnsureStore -Scope $Scope
+    Stop-Edge -Scope $Scope
     $stack = _ReadStack $info.Stack
     $entry = $stack | Where-Object { $_.Id -eq $Id }
     if (-not $entry) { throw "Not found." }
@@ -141,7 +218,7 @@ function Restore-Edgey {
         if (Test-Path $f.Backup) {
             try { Copy-Item -Path $f.Backup -Destination $f.Source -Force -ErrorAction SilentlyContinue } catch {
                 $leaf = Split-Path $f.Source -Leaf
-                $cands = if ($PerUser) { _GetProfileVariations } else { _GetEdgeInstallRoots | ForEach-Object { Join-Path $_ "Variations" } }
+                $cands = if ($Scope -eq 'User') { _GetProfileVariations } else { _GetEdgeInstallRoots | ForEach-Object { Join-Path $_ "Variations" } }
                 foreach ($c in $cands) { $cand = Join-Path $c $leaf; Copy-Item -Path $f.Backup -Destination $cand -Force -ErrorAction SilentlyContinue }
             }
         }
@@ -149,7 +226,7 @@ function Restore-Edgey {
     Write-Output "Restored id: $Id"
 }
 
-function Diagnose-Edgey {
+function Test-Edge {
     [CmdletBinding()]
     param()
     $o = [ordered]@{}
@@ -157,14 +234,13 @@ function Diagnose-Edgey {
     $roots = _GetEdgeInstallRoots; $o.EdgeRoots = $roots
     $vers = @(); foreach ($r in $roots) { $exe = Join-Path $r "msedge.exe"; if (Test-Path $exe) { $vers += [pscustomobject]@{ Path=$r; Version=(Get-Item $exe).VersionInfo.ProductVersion } } }
     $o.EdgeVersions = $vers
-    $vars = @(); $cands = _GetProfileVariations + ($roots | ForEach-Object { Join-Path $_ "Variations" })
+    $vars = @(); $cands = @(_GetProfileVariations) + @($roots | ForEach-Object { Join-Path $_ "Variations" })
     foreach ($v in $cands | Select-Object -Unique) { if (Test-Path $v) { Get-ChildItem -Path $v -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'seed|variations_seed' } | ForEach-Object { $h=(Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash; $vars += [pscustomobject]@{ Folder=$v; File=$_.Name; Hash=$h; Size=$_.Length } } } }
     $o.Variations = $vars
     $o.Processes = Get-Process -Name msedge -ErrorAction SilentlyContinue | Select-Object Id,StartTime,Path -ErrorAction SilentlyContinue
-    $userInfo = _EnsureStore -PerUser; $o.UserBackupRoot = $userInfo.Root; $o.UserBackups = if (Test-Path $userInfo.Root) { Get-ChildItem -Path $userInfo.Root -Directory -ErrorAction SilentlyContinue | Select-Object Name,LastWriteTime } else { @() }
-    if (Test-IsAdmin) { $adm = _EnsureStore -PerUser:$false; $o.AdminBackupRoot = $adm.Root; $o.AdminBackups = if (Test-Path $adm.Root) { Get-ChildItem -Path $adm.Root -Directory -ErrorAction SilentlyContinue | Select-Object Name,LastWriteTime } else { @() } } else { $o.AdminBackupRoot = "requires elevation" }
-    $o | Format-List
+    $userInfo = _EnsureStore -Scope User; $o.UserBackupRoot = $userInfo.Root; $o.UserBackups = if (Test-Path $userInfo.Root) { Get-ChildItem -Path $userInfo.Root -Directory -ErrorAction SilentlyContinue | Select-Object Name,LastWriteTime } else { @() }
+    if (Test-IsAdmin) { $adm = _EnsureStore -Scope Machine; $o.AdminBackupRoot = $adm.Root; $o.AdminBackups = if (Test-Path $adm.Root) { Get-ChildItem -Path $adm.Root -Directory -ErrorAction SilentlyContinue | Select-Object Name,LastWriteTime } else { @() } } else { $o.AdminBackupRoot = "requires elevation" }
+    [PSCustomObject]$o
 }
 
-Export-ModuleMember -Function Backup-Edgey, Push-Edgey, Pop-Edgey, Get-EdgeyBackups, Restore-Edgey, Diagnose-Edgey, Stop-Edgey, Start-Edgey
-```
+Export-ModuleMember -Function Backup-Edge, Push-Edge, Pop-Edge, Get-EdgeBackups, Restore-Edge, Test-Edge, Stop-Edge
